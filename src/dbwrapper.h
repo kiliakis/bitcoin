@@ -11,11 +11,13 @@
 #include <streams.h>
 #include <util/system.h>
 #include <util/strencodings.h>
-
+#include <rte_mempool.h>
+#include <rte_mbuf.h>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
 // For MegaKV
+#include <rte_mempool.h>
 
 /* Following protocol speicific parameters should be same with MEGA */
 #define PROTOCOL_MAGIC  0x1234
@@ -47,6 +49,132 @@
 #define LOCAL_IP_ADDR (uint32_t)(456)
 #define LOCAL_UDP_PORT (uint16_t)(123)
 
+#define _GNU_SOURCE
+#define __USE_GNU
+
+#define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
+#define NB_MBUF  2048
+
+/*
+ * RX and TX Prefetch, Host, and Write-back threshold values should be
+ * carefully set for optimal performance. Consult the network
+ * controller's datasheet and supporting DPDK documentation for guidance
+ * on how these parameters should be set.
+ */
+#define RX_PTHRESH 8 /**< Default values of RX prefetch threshold reg. */
+#define RX_HTHRESH 8 /**< Default values of RX host threshold reg. */
+#define RX_WTHRESH 4 /**< Default values of RX write-back threshold reg. */
+
+/*
+ * These default values are optimized for use with the Intel(R) 82599 10 GbE
+ * Controller and the DPDK ixgbe PMD. Consider using other values for other
+ * network controllers and/or network drivers.
+ */
+#define TX_PTHRESH 36 /**< Default values of TX prefetch threshold reg. */
+#define TX_HTHRESH 0  /**< Default values of TX host threshold reg. */
+#define TX_WTHRESH 0  /**< Default values of TX write-back threshold reg. */
+
+#define MAX_PKT_BURST 1
+#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
+
+/*
+ * Configurable number of RX/TX ring descriptors
+ */
+#define RTE_TEST_RX_DESC_DEFAULT 128
+#define RTE_TEST_TX_DESC_DEFAULT 512
+
+#define MAX_RX_QUEUE_PER_LCORE 16
+#define MAX_TX_QUEUE_PER_PORT 16
+#define NUM_MAX_CORE 32
+
+#define TIMER_MILLISECOND 2000000ULL /* around 1ms at 2 Ghz */
+#define MAX_TIMER_PERIOD 86400 /* 1 day max */
+
+#define EIU_HEADER_LEN  42//14+20+8 = 42
+#define ETHERNET_HEADER_LEN 14
+
+
+static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
+static uint16_t nb_txd = RTE_TEST_TX_DESC_DEFAULT;
+
+struct mbuf_table {
+    unsigned len;
+    struct rte_mbuf *m_table[MAX_PKT_BURST];
+};
+
+struct lcore_queue_conf {
+    struct mbuf_table tx_mbufs[MAX_TX_QUEUE_PER_PORT];
+} __rte_cache_aligned;
+
+
+static const struct rte_eth_conf port_conf = {
+    .rxmode = {
+        .mq_mode = ETH_MQ_RX_RSS,
+        .max_rx_pkt_len = ETHER_MAX_LEN,
+        .split_hdr_size = 0,
+        .header_split   = 0, /**< Header Split disabled */
+        .hw_ip_checksum = 0, /**< IP checksum offload disabled */
+        .hw_vlan_filter = 0, /**< VLAN filtering disabled */
+        .jumbo_frame    = 0, /**< Jumbo Frame Support disabled */
+        .hw_strip_crc   = 0, /**< CRC stripped by hardware */
+    },
+    .rx_adv_conf = {
+        .rss_conf = {
+            .rss_key = NULL,
+            .rss_hf = ETH_RSS_IP,
+        },
+    },
+    .txmode = {
+        .mq_mode = ETH_MQ_TX_NONE,
+    },
+};
+
+static const struct rte_eth_rxconf rx_conf = {
+    .rx_thresh = {
+        .pthresh = RX_PTHRESH,
+        .hthresh = RX_HTHRESH,
+        .wthresh = RX_WTHRESH,
+    },
+};
+
+static const struct rte_eth_txconf tx_conf = {
+    .tx_thresh = {
+        .pthresh = TX_PTHRESH,
+        .hthresh = TX_HTHRESH,
+        .wthresh = TX_WTHRESH,
+    },
+    .tx_free_thresh = 0, /* Use PMD default values */
+    .tx_rs_thresh = 0, /* Use PMD default values */
+    /*
+     * As the example won't handle mult-segments and offload cases,
+     * set the flag by default.
+     */
+    .txq_flags = ETH_TXQ_FLAGS_NOMULTSEGS | ETH_TXQ_FLAGS_NOOFFLOADS,
+};
+
+// rte_mempool *recv_pktmbuf_pool[NUM_QUEUE];
+// rte_mempool *send_pktmbuf_pool = NULL;
+
+/* Per-port statistics struct */
+struct benchmark_core_statistics {
+    uint64_t tx;
+    uint64_t rx;
+    uint64_t dropped;
+    int enable;
+} __rte_cache_aligned;
+
+
+
+// typedef struct context_s {
+//     unsigned int core_id;
+//     unsigned int queue_id;
+// } context_t;
+
+
+/* 1500 bytes MTU + 14 Bytes Ethernet header */
+// int pktlen;
+
+
 // End for MegaKV
 
 
@@ -61,9 +189,35 @@ public:
 
 class CDBWrapper;
 
+
+class WriteBatch {
+private:
+    struct rte_mempool *send_pktmbuf_pool = NULL;
+    lcore_queue_conf *qconf;
+    unsigned int core_id;
+    unsigned int queue_id;
+    char *curr_pos = NULL; // points to the position of the packet we have to write. 
+public:
+    WriteBatch::WriteBatch();
+
+    // struct rte_mbuf *m;
+
+    // struct rte_mempool *recv_pktmbuf_pool[NUM_QUEUE];
+    // struct rte_mempool *send_pktmbuf_pool = NULL;
+
+    void Put(const char* key, size_t key_size, const char* value, size_t value_size);
+
+    void Clear();
+
+    void Delete(const char* key, size_t key_size);
+
+};
+
 /** These should be considered an implementation detail of the specific database.
  */
 namespace dbwrapper_private {
+
+
 
 /** Handle database error by throwing dbwrapper_error exception.
  */
@@ -84,7 +238,8 @@ class CDBBatch
 
 private:
     const CDBWrapper &parent;
-    leveldb::WriteBatch batch;
+    // LevelDB::WriteBatch batch;
+    WriteBatch batch;
 
     CDataStream ssKey;
     CDataStream ssValue;
@@ -95,7 +250,10 @@ public:
     /**
      * @param[in] _parent   CDBWrapper that this batch is to be submitted to
      */
-    explicit CDBBatch(const CDBWrapper &_parent) : parent(_parent), ssKey(SER_DISK, CLIENT_VERSION), ssValue(SER_DISK, CLIENT_VERSION), size_estimate(0) { };
+    explicit CDBBatch(const CDBWrapper &_parent) : parent(_parent),
+        ssKey(SER_DISK, CLIENT_VERSION),
+        ssValue(SER_DISK, CLIENT_VERSION), 
+        size_estimate(EIU_HEADER_LEN + MEGA_MAGIC_NUM_LEN + MEGA_END_MARK_LEN) { };
 
     void Clear();
     // {
@@ -205,7 +363,7 @@ public:
     //     return true;
     // }
 
-    unsigned int GetValueSize(); 
+    unsigned int GetValueSize();
     // {
     //     return piter->value().size();
     // }
