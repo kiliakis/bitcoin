@@ -72,49 +72,102 @@ struct timeval startime;
 struct timeval endtime;
 uint64_t ts_count[NUM_QUEUE], ts_total[NUM_QUEUE];
 
-
-WriteBatch::WriteBatch(unsigned int _core_id,
+// in this function I initialize all the necessary stuff I need for the packets
+megakv::WriteBatch::WriteBatch(unsigned int _core_id,
                        unsigned int _queue_id)
 {
 
     // rte_mbuf *m;
+    int ret;
 
     core_id = _core_id;
     queue_id = _queue_id;
     qconf = &lcore_queue_conf[queue_id];
 
-    // unsigned long mask = 1 << core_id;
-    // TODO: See other "Disabled CPU affinity" TODOs
-    // if (sched_setaffinity(0, sizeof(unsigned long), (cpu_set_t *)&mask) < 0) {
-    //     printf("core id = %d\n", core_id);
-    //     assert(0);
-    // }
+    // Create the mbuf pool
+    send_pktmbuf_pool =
+        rte_mempool_create("send_mbuf_pool", NB_MBUF,
+                   MBUF_SIZE, 32,
+                   sizeof(struct rte_pktmbuf_pool_private),
+                   rte_pktmbuf_pool_init, NULL,
+                   rte_pktmbuf_init, NULL,
+                   rte_socket_id(), 0);
+    if (send_pktmbuf_pool == NULL)
+        rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
-    unsigned int tmp_pktlen;
+    if (rte_eal_pci_probe() < 0)
+        rte_exit(EXIT_FAILURE, "Cannot probe PCI\n");
 
-    struct ether_hdr *ethh;
-    struct ipv4_hdr *iph;
-    struct udp_hdr *udph;
+    uint8_t nb_ports = rte_eth_dev_count();
+    assert (nb_ports == 1);
 
-    /* for 1GB hash table, 512MB signature, 32bits, total is 128M = 2^29/2^2 = 2^27
-     * load 80% of the hash table */
-    const uint32_t total_cnt = (uint32_t)TOTAL_CNT;
-    uint32_t preload_cnt = (uint32_t)PRELOAD_CNT;
+    /* Initialise each port */
+    for (uint8_t portid = 0; portid < nb_ports; portid++) {
+        /* init port */
+        printf("Initializing port %u... ", (unsigned) portid);
+        ret = rte_eth_dev_configure(portid, NUM_QUEUE, NUM_QUEUE, &port_conf);
+        if (ret < 0)
+            rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n",
+                  ret, (unsigned) portid);
 
-    struct zipf_gen_state zipf_state;
-    mehcached_zipf_init(&zipf_state, (uint64_t)preload_cnt - 2, (double)ZIPF_THETA, (uint64_t)21);
-    //printf("LOAD_FACTOR is %f, total key cnt is %d\n", LOAD_FACTOR, total_cnt);
+        for (queue_id = 0; queue_id < NUM_QUEUE; queue_id ++) {
+            /* init RX queues */
+            // ret = rte_eth_rx_queue_setup(portid, queue_id, nb_rxd,
+            //         rte_eth_dev_socket_id(portid), &rx_conf,
+            //         recv_pktmbuf_pool[queue_id]);
+            // if (ret < 0)
+            //     rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n",
+            //             ret, (unsigned) portid);
+
+            /* init TX queues */
+            ret = rte_eth_tx_queue_setup(portid, queue_id, nb_txd,
+                    rte_eth_dev_socket_id(portid), &tx_conf);
+            if (ret < 0)
+                rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d, port=%u\n",
+                        ret, (unsigned) portid);
+        }
+
+        /* Start device */
+        ret = rte_eth_dev_start(portid);
+        if (ret < 0)
+            rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n",
+                  ret, (unsigned) portid);
+
+        printf("done: \n");
+
+        rte_eth_promiscuous_enable(portid);
+
+        /* initialize port stats */
+        memset(&core_statistics, 0, sizeof(core_statistics));
+    }
+    fflush(stdout);
+
+    check_all_ports_link_status(nb_ports, 0);
+
+    for (i = 0; i < NUM_QUEUE; i ++) {
+        ts_total[i] = 0;
+        ts_count[i] = 1;
+    }
+
+    
+    // /* for 1GB hash table, 512MB signature, 32bits, total is 128M = 2^29/2^2 = 2^27
+    //  * load 80% of the hash table */
+    // const uint32_t total_cnt = (uint32_t)TOTAL_CNT;
+    // uint32_t preload_cnt = (uint32_t)PRELOAD_CNT;
+
+    // struct zipf_gen_state zipf_state;
+    // mehcached_zipf_init(&zipf_state, (uint64_t)preload_cnt - 2, (double)ZIPF_THETA, (uint64_t)21);
 
     for (unsigned i = 0; i < MAX_PKT_BURST; i ++) {
         rte_mbuf *m = rte_pktmbuf_alloc(send_pktmbuf_pool);
         assert (m != NULL);
         qconf->tx_mbufs[queue_id].m_table[i] = m;
 
-        ethh = (struct ether_hdr *)rte_pktmbuf_mtod(m, unsigned char *);
+        auto ethh = (struct ether_hdr *)rte_pktmbuf_mtod(m, unsigned char *);
         //ethh->s_addr = LOCAL_MAC_ADDR;
         ethh->ether_type = rte_cpu_to_be_16((uint16_t)(ETHER_TYPE_IPv4));
 
-        iph = (struct ipv4_hdr *)((unsigned char *)ethh + sizeof(struct ether_hdr));
+        auto iph = (struct ipv4_hdr *)((unsigned char *)ethh + sizeof(struct ether_hdr));
         iph->version_ihl = 0x40 | 0x05;
         iph->type_of_service = 0;
         iph->packet_id = 0;
@@ -125,7 +178,7 @@ WriteBatch::WriteBatch(unsigned int _core_id,
         iph->src_addr = LOCAL_IP_ADDR;
         iph->dst_addr = KV_IP_ADDR;
 
-        udph = (struct udp_hdr *)((unsigned char *)iph + sizeof(struct ipv4_hdr));
+        auto udph = (struct udp_hdr *)((unsigned char *)iph + sizeof(struct ipv4_hdr));
         udph->src_port = LOCAL_UDP_PORT;
         udph->dst_port = KV_UDP_PORT;
         udph->dgram_cksum = 0;
@@ -136,82 +189,26 @@ WriteBatch::WriteBatch(unsigned int _core_id,
 
     qconf->tx_mbufs[queue_id].len = MAX_PKT_BURST;
 
+}
 
-    struct rte_mbuf **m_table;
-    uint32_t *ip;
-    uint32_t ip_ctr = 1;
-    unsigned int port, ret;
-    uint32_t get_key = 1, set_key = 1;
+void megakv::WriteBatch::Put(const char* key, size_t key_size, const char* value, size_t value_size) {
 
-    /* update packet length for the workload packets */
-    pktlen = length_packet[WORKLOAD_ID];
-
-    for (i = 0; i < MAX_PKT_BURST; i ++) {
-        m = qconf->tx_mbufs[queue_id].m_table[i];
-        assert (m != NULL);
-        rte_pktmbuf_pkt_len(m) = (uint16_t)pktlen;
-        rte_pktmbuf_data_len(m) = (uint16_t)pktlen;
-
-        ethh = (struct ether_hdr *)rte_pktmbuf_mtod(m, unsigned char *);
-        iph = (struct ipv4_hdr *)((unsigned char *)ethh + sizeof(struct ether_hdr));
-        udph = (struct udp_hdr *)((unsigned char *)iph + sizeof(struct ipv4_hdr));
-
-        iph->total_length = rte_cpu_to_be_16((uint16_t)(pktlen - sizeof(struct ether_hdr)));
-        udph->dgram_len = rte_cpu_to_be_16((uint16_t)(pktlen - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr)));
-    }
-
-    if (queue_id == 0) {
-        gettimeofday(&startime, NULL);
-    }
-    core_statistics[core_id].enable = 1;
-
+    request_v.push_back(new Request(MEGA_JOB_SET, key, key_size, value, value_size));
+    return;
 
 }
 
-void WriteBatch::Put(const char* key, size_t key_size, const char* value, size_t value_size) {
-    assert(payload_len + SET_LEN <= ETHERNET_MAX_FRAME_LEN);
-
-    *(uint16_t *)ptr = MEGA_JOB_SET;
-    ptr += sizeof(uint16_t); /* 2 bytes job type */
-    *(uint16_t *)ptr = key_size;
-    ptr += sizeof(uint16_t); /* 2 bytes key length */
-    *(uint32_t *)ptr = value_size;
-    ptr += sizeof(uint32_t); /* 4 bytes value length */
-
-    /* 64 bits key */
-    if (BITS_INSERT_BUF == 0)
-        *(uint32_t *)(ptr + sizeof(uint32_t)) = set_key;
-    else
-        *(uint32_t *)(ptr + sizeof(uint32_t)) = (rte_bswap32(set_key & 0xff) << (8 - BITS_INSERT_BUF)) | (set_key);
-    *(uint32_t *)(ptr) = set_key;
-
-    ptr += KEY_LEN;
-
-
-    /* Now I copy the value */
-    *(uint32_t *)(ptr) = set_key;
-
-    ptr += VALUE_LEN;
-
-    payload_len += SET_LEN;
-
-    set_key ++;
-    if (set_key >= preload_cnt) {
-        break;
-    }
+void megakv::WriteBatch::Clear() {
+    request_v.clear();
     return;
 }
 
-void WriteBatch::Clear() {
+void megakv::WriteBatch::Delete(const char* key, size_t key_size) {
+    request_v.push_back(new Request(MEGA_JOB_DEL, key, key_size));
     return;
 }
 
-void WriteBatch::Delete(const char* key, size_t key_size) {
-    return;
-}
-
-
-class CBitcoinLevelDBLogger : public leveldb::Logger {
+class CBitcoinLevelDBLogger {
 public:
     // This code is adapted from posix_logger.h, which is why it is using vsprintf.
     // Please do not do this in normal code
@@ -260,7 +257,7 @@ public:
 
             assert(p <= limit);
             base[std::min(bufsize - 1, (int)(p - base))] = '\0';
-            LogPrintf("leveldb: %s", base);  /* Continued */
+            LogPrintf("megakv: %s", base);  /* Continued */
             if (base != buffer) {
                 delete[] base;
             }
@@ -269,59 +266,55 @@ public:
     }
 };
 
-static void SetMaxOpenFiles(leveldb::Options *options) {
-    // On most platforms the default setting of max_open_files (which is 1000)
-    // is optimal. On Windows using a large file count is OK because the handles
-    // do not interfere with select() loops. On 64-bit Unix hosts this value is
-    // also OK, because up to that amount LevelDB will use an mmap
-    // implementation that does not use extra file descriptors (the fds are
-    // closed after being mmap'ed).
-    //
-    // Increasing the value beyond the default is dangerous because LevelDB will
-    // fall back to a non-mmap implementation when the file count is too large.
-    // On 32-bit Unix host we should decrease the value because the handles use
-    // up real fds, and we want to avoid fd exhaustion issues.
-    //
-    // See PR #12495 for further discussion.
+// static void SetMaxOpenFiles(megakv::Options *options) {
+//     // On most platforms the default setting of max_open_files (which is 1000)
+//     // is optimal. On Windows using a large file count is OK because the handles
+//     // do not interfere with select() loops. On 64-bit Unix hosts this value is
+//     // also OK, because up to that amount LevelDB will use an mmap
+//     // implementation that does not use extra file descriptors (the fds are
+//     // closed after being mmap'ed).
+//     //
+//     // Increasing the value beyond the default is dangerous because LevelDB will
+//     // fall back to a non-mmap implementation when the file count is too large.
+//     // On 32-bit Unix host we should decrease the value because the handles use
+//     // up real fds, and we want to avoid fd exhaustion issues.
+//     //
+//     // See PR #12495 for further discussion.
 
-    int default_open_files = options->max_open_files;
-#ifndef WIN32
-    if (sizeof(void*) < 8) {
-        options->max_open_files = 64;
-    }
-#endif
-    LogPrint(BCLog::LEVELDB, "LevelDB using max_open_files=%d (default=%d)\n",
-             options->max_open_files, default_open_files);
-}
+//     int default_open_files = options->max_open_files;
+// #ifndef WIN32
+//     if (sizeof(void*) < 8) {
+//         options->max_open_files = 64;
+//     }
+// #endif
+//     LogPrint(BCLog::LEVELDB, "MegaKV using max_open_files=%d (default=%d)\n",
+//              options->max_open_files, default_open_files);
+// }
 
-static leveldb::Options GetOptions(size_t nCacheSize)
-{
-    leveldb::Options options;
-    options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);
-    options.write_buffer_size = nCacheSize / 4; // up to two write buffers may be held in memory simultaneously
-    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
-    options.compression = leveldb::kNoCompression;
-    options.info_log = new CBitcoinLevelDBLogger();
-    if (leveldb::kMajorVersion > 1 || (leveldb::kMajorVersion == 1 && leveldb::kMinorVersion >= 16)) {
-        // LevelDB versions before 1.16 consider short writes to be corruption. Only trigger error
-        // on corruption in later versions.
-        options.paranoid_checks = true;
-    }
-    SetMaxOpenFiles(&options);
-    return options;
-}
+// static megakv::Options GetOptions(size_t nCacheSize)
+// {
+//     megakv::Options options;
+//     options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);
+//     options.write_buffer_size = nCacheSize / 4; // up to two write buffers may be held in memory simultaneously
+//     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+//     options.compression = leveldb::kNoCompression;
+//     options.info_log = new CBitcoinLevelDBLogger();
+//     if (leveldb::kMajorVersion > 1 || (leveldb::kMajorVersion == 1 && leveldb::kMinorVersion >= 16)) {
+//         // LevelDB versions before 1.16 consider short writes to be corruption. Only trigger error
+//         // on corruption in later versions.
+//         options.paranoid_checks = true;
+//     }
+//     SetMaxOpenFiles(&options);
+//     return options;
+// }
 
 // CDBBatch
 
 void CDBBatch::Clear()
 {
     batch.Clear();
-    // In the beginning of the packet:
-    // - I have the ethernet header length,
-    // - the magic_num
-    // - in the end, the end mark
-    // EIU_HEADER_LEN + MEGA_MAGIC_NUM_LEN + MEGA_END_MARK_LEN
     size_estimate = EIU_HEADER_LEN + MEGA_MAGIC_NUM_LEN + MEGA_END_MARK_LEN;
+    // this must be equal to 14 + 20 + 8 + 2 + 2
 }
 
 // this is a SET job type, it just adds to the buffer.
@@ -388,7 +381,7 @@ void CDBBatch::Erase(const K& key)
 
 
 // CDBIterator
-
+// TODO this is not really supported, find where it is used and replace it
 CDBIterator::~CDBIterator() { delete piter; }
 bool CDBIterator::Valid() const { return piter->Valid(); }
 void CDBIterator::SeekToFirst() { piter->SeekToFirst(); }
@@ -507,24 +500,90 @@ CDBWrapper::~CDBWrapper()
 bool CDBWrapper::WriteBatch(CDBBatch& batch, bool fSync)
 {
     const bool log_memory = LogAcceptCategory(BCLog::LEVELDB);
-    port = 0;
     double mem_before = 0;
     if (log_memory) {
         mem_before = DynamicMemoryUsage() / 1024.0 / 1024;
     }
-    leveldb::Status status = pdb->Write(fSync ? syncoptions : writeoptions, &batch.batch);
-    dbwrapper_private::HandleError(status);
+
+    // Here I calculate the number of packets, and their length
+    // that are needed in order to send all the requests in the request_v. 
+    std::vector<size_t> pktlens({EIU_HEADER_LEN + 2 + 2});
+    for (const auto &v : request_v) {
+        const size_t size = v->size();
+        if (pktlens.back() + size <= ETHERNET_MAX_FRAME_LEN)
+            pktlens.back() += size;
+        else
+            pktlens.push_back(EIU_HEADER_LEN + 2 + 2);
+    }
+
+
+    // Here I need to serialize and send the packet.
+    while (int j < pktlens.size()) {
+        // First I initialize the packets
+        for (int i = 0; i < MAX_PKT_BURST; i++) {
+            // pkt header initialization
+            int pktlen = pktlens[j + i];
+
+            m = qconf->tx_mbufs[queue_id].m_table[i];
+            assert (m != NULL);
+            rte_pktmbuf_pkt_len(m) = (uint16_t)pktlen;
+            rte_pktmbuf_data_len(m) = (uint16_t)pktlen;
+
+            auto ethh = (struct ether_hdr *)rte_pktmbuf_mtod(m, unsigned char *);
+            auto iph = (struct ipv4_hdr *)((unsigned char *)ethh + sizeof(struct ether_hdr));
+            auto udph = (struct udp_hdr *)((unsigned char *)iph + sizeof(struct ipv4_hdr));
+
+            iph->total_length = rte_cpu_to_be_16((uint16_t)(pktlen - sizeof(struct ether_hdr)));
+            udph->dgram_len = rte_cpu_to_be_16((uint16_t)(pktlen - sizeof(struct ether_hdr) - sizeof(struct ipv4_hdr)));
+
+            // now I add the main data
+            ip = (uint32_t *)((char *)rte_ctrlmbuf_data(m_table[i]) + 26);
+            *ip = ip_ctr ++;
+            /* skip the packet header and magic number */
+            char *ptr = (char *)rte_ctrlmbuf_data(m_table[i]) + EIU_HEADER_LEN + MEGA_MAGIC_NUM_LEN;
+
+            int datalen = EIU_HEADER_LEN + 2 + 2;
+            while (!request_v.empty() &&
+                    (datalen + request_v.front()->size() <= ETHERNET_MAX_FRAME_LEN)) {
+                Request *front = request_v.front();
+                *(uint16_t *)ptr = front->type; // MEGA_JOB_SET or MEGA_JOB_GET
+                ptr += sizeof(uint16_t);
+                *(uint16_t *)ptr = front->key_size;
+                ptr += sizeof(uint16_t);
+                memcpy(ptr, front->key, front->key_size);
+
+                if (front->type == MEGA_JOB_SET) {
+                    *(uint32_t *)ptr = front->val_size;
+                    ptr += sizeof(uint32_t); /* 4 bytes value length */
+                    memcpy(ptr, front->val, front->val_size);
+                    ptr += front->val_size;
+                }
+                datalen += front->size();
+                request_v.pop_front();
+                /* skip job_type, key length = 4 bytes in total */
+            }
+            assert(datalen == pktlens[j]);
+            *(uint16_t *)ptr = 0xFFFF;
+        }
+        j += MAX_PKT_BURST;
+        unsigned int port = 0;
+        unsigned int ret = 0;
+        assert(qconf->tx_mbufs[queue_id].len == MAX_PKT_BURST);
+        ret = rte_eth_tx_burst(port, (uint16_t)queue_id, m_table, (uint16_t)qconf->tx_mbufs[queue_id].len);
+        core_statistics[core_id].tx += ret;
+        if (ret < qconf->tx_mbufs[queue_id].len) {
+            core_statistics[core_id].dropped += (qconf->tx_mbufs[queue_id].len - ret);
+        }
+    }
+
+    // leveldb::Status status = pdb->Write(fSync ? syncoptions : writeoptions, &batch.batch);
+    // dbwrapper_private::HandleError(status);
     if (log_memory) {
         double mem_after = DynamicMemoryUsage() / 1024.0 / 1024;
         LogPrint(BCLog::LEVELDB, "WriteBatch memory usage: db=%s, before=%.1fMiB, after=%.1fMiB\n",
                  m_name, mem_before, mem_after);
 
     }
-    unsigned int port, ret;
-    port = 0;
-    assert(qconf->tx_mbufs[queue_id].len == MAX_PKT_BURST);
-    ret = rte_eth_tx_burst(port, (uint16_t)queue_id, m_table, (uint16_t)qconf->tx_mbufs[queue_id].len);
-
     return true;
 }
 
@@ -557,7 +616,8 @@ std::vector<unsigned char> CDBWrapper::CreateObfuscateKey() const
 
 }
 
-
+// TODO what if I use some sort of flag for this
+// the first time I add an element I mark it as not empty
 bool CDBWrapper::IsEmpty()
 {
     std::unique_ptr<CDBIterator> it(NewIterator());
@@ -567,7 +627,7 @@ bool CDBWrapper::IsEmpty()
 
 // get type
 template <typename K, typename V>
-bool CDBWrapper::Read(const K& key, V& value) const
+bool CDBWrapper::Read(const K & key, V & value) const
 {
     CDataStream ssKey(SER_DISK, CLIENT_VERSION);
     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
@@ -592,9 +652,8 @@ bool CDBWrapper::Read(const K& key, V& value) const
     return true;
 }
 
-// set type, this only adds data to the write buffer.
 template <typename K, typename V>
-bool CDBWrapper::Write(const K& key, const V& value, bool fSync = false)
+bool CDBWrapper::Write(const K & key, const V & value, bool fSync = false)
 {
     CDBBatch batch(*this);
     batch.Write(key, value);
@@ -603,7 +662,7 @@ bool CDBWrapper::Write(const K& key, const V& value, bool fSync = false)
 
 // get type
 template <typename K>
-bool CDBWrapper::Exists(const K& key) const
+bool CDBWrapper::Exists(const K & key) const
 {
     CDataStream ssKey(SER_DISK, CLIENT_VERSION);
     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
@@ -623,7 +682,7 @@ bool CDBWrapper::Exists(const K& key) const
 
 // Not really needed
 template <typename K>
-bool CDBWrapper::Erase(const K& key, bool fSync = false)
+bool CDBWrapper::Erase(const K & key, bool fSync = false)
 {
     CDBBatch batch(*this);
     batch.Erase(key);
@@ -631,20 +690,21 @@ bool CDBWrapper::Erase(const K& key, bool fSync = false)
 }
 
 // can be approximated possibly
+// not supported 
 template<typename K>
-size_t CDBWrapper::EstimateSize(const K& key_begin, const K& key_end) const
+size_t CDBWrapper::EstimateSize(const K & key_begin, const K & key_end) const
 {
-    CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
-    ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    ssKey1 << key_begin;
-    ssKey2 << key_end;
-    leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
-    leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
-    uint64_t size = 0;
-    leveldb::Range range(slKey1, slKey2);
-    pdb->GetApproximateSizes(&range, 1, &size);
-    return size;
+    // CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
+    // ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+    // ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
+    // ssKey1 << key_begin;
+    // ssKey2 << key_end;
+    // leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
+    // leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
+    // uint64_t size = 0;
+    // leveldb::Range range(slKey1, slKey2);
+    // pdb->GetApproximateSizes(&range, 1, &size);
+    return 0;
 }
 
 /**
@@ -652,7 +712,7 @@ size_t CDBWrapper::EstimateSize(const K& key_begin, const K& key_end) const
  */
 // Used in 1-2 places, we could have a dummy implementation
 template<typename K>
-void CDBWrapper::CompactRange(const K& key_begin, const K& key_end) const
+void CDBWrapper::CompactRange(const K & key_begin, const K & key_end) const
 {
     // CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
     // ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);

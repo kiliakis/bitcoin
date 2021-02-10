@@ -13,69 +13,34 @@
 #include <util/strencodings.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
-#include <leveldb/db.h>
-#include <leveldb/write_batch.h>
 
+#include <deque>
+// #include <leveldb/db.h>
+// #include <leveldb/write_batch.h>
 // For MegaKV
 #include <rte_mempool.h>
 
-/* Following protocol speicific parameters should be same with MEGA */
-#define PROTOCOL_MAGIC  0x1234
-#define MEGA_JOB_GET 0x2
-#define MEGA_JOB_SET 0x3
 /* BITS_INSERT_BUF should be same with mega: config->bits_insert_buf */
 #define BITS_INSERT_BUF 3 // 2^3 = 8
 
-#define MEGA_MAGIC_NUM_LEN  2
-#define MEGA_END_MARK_LEN   2
+/* Following protocol speicific parameters should be same with MEGA */
+const uint16_t PROTOCOL_MAGIC = 0x1234;
 
-#define ZIPF_THETA 0.00
-#define AFFINITY_ONE_NODE 1
-#define NUM_QUEUE 4
+const uint16_t MEGA_MAGIC_NUM_LEN = 2;
+const uint16_t MEGA_END_MARK_LEN = 2;
 
-/* Hash Table Load Factor, These should be the same with the main program
- * if PRELOAD is disabled! TODO: avoid mismatches */
-#define LOAD_FACTOR 0.2
-#define PRELOAD_CNT (LOAD_FACTOR * ((1 << 30)/8))
-#define TOTAL_CNT (((uint32_t)1 << 31) - 1)
+const uint16_t ETHERNET_MAX_FRAME_LEN = 1514;
+const uint16_t EIU_HEADER_LEN = 42;      //14+20+8 = 42
+const uint16_t ETHERNET_HEADER_LEN = 14;
 
-#define KEY_LEN         8
-#define VALUE_LEN       8
-#define SET_LEN     (KEY_LEN + VALUE_LEN + 8)
-#define ETHERNET_MAX_FRAME_LEN  1514
-
-#define KV_IP_ADDR (uint32_t)(789)
-#define KV_UDP_PORT (uint16_t)(124)
-#define LOCAL_IP_ADDR (uint32_t)(456)
-#define LOCAL_UDP_PORT (uint16_t)(123)
+const uint32_t KV_IP_ADDR = (uint32_t)(789);
+const uint16_t KV_UDP_PORT = (uint16_t)(124);
+const uint32_t LOCAL_IP_ADDR = (uint32_t)(456);
+const uint16_t LOCAL_UDP_PORT = (uint16_t)(123);
 
 #define _GNU_SOURCE
 #define __USE_GNU
 
-#define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
-#define NB_MBUF  2048
-
-/*
- * RX and TX Prefetch, Host, and Write-back threshold values should be
- * carefully set for optimal performance. Consult the network
- * controller's datasheet and supporting DPDK documentation for guidance
- * on how these parameters should be set.
- */
-#define RX_PTHRESH 8 /**< Default values of RX prefetch threshold reg. */
-#define RX_HTHRESH 8 /**< Default values of RX host threshold reg. */
-#define RX_WTHRESH 4 /**< Default values of RX write-back threshold reg. */
-
-/*
- * These default values are optimized for use with the Intel(R) 82599 10 GbE
- * Controller and the DPDK ixgbe PMD. Consider using other values for other
- * network controllers and/or network drivers.
- */
-#define TX_PTHRESH 36 /**< Default values of TX prefetch threshold reg. */
-#define TX_HTHRESH 0  /**< Default values of TX host threshold reg. */
-#define TX_WTHRESH 0  /**< Default values of TX write-back threshold reg. */
-
-#define MAX_PKT_BURST 1
-#define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 
 /*
  * Configurable number of RX/TX ring descriptors
@@ -83,15 +48,20 @@
 #define RTE_TEST_RX_DESC_DEFAULT 128
 #define RTE_TEST_TX_DESC_DEFAULT 512
 
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
-#define NUM_MAX_CORE 32
 
 #define TIMER_MILLISECOND 2000000ULL /* around 1ms at 2 Ghz */
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 
-#define EIU_HEADER_LEN  42//14+20+8 = 42
-#define ETHERNET_HEADER_LEN 14
+const float ZIPF_THETA = 0.00;
+const uint16_t AFFINITY_ONE_NODE = 1;
+const uint16_t NUM_QUEUE = 4;
+const uint16_t MAX_RX_QUEUE_PER_LCORE = 16;
+const uint16_t MAX_TX_QUEUE_PER_PORT = 16;
+const uint16_t NUM_MAX_CORE = 32;
+const uint16_t MAX_PKT_BURST = 1;
+const uint16_t BURST_TX_DRAIN_US = 100; /* TX drain every ~100us */
+const uint16_t MBUF_SIZE = (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM);
+const uint16_t NB_MBUF =  2048;
 
 
 static uint16_t nb_rxd = RTE_TEST_RX_DESC_DEFAULT;
@@ -129,6 +99,17 @@ static const struct rte_eth_conf port_conf = {
     },
 };
 
+/*
+ * RX and TX Prefetch, Host, and Write-back threshold values should be
+ * carefully set for optimal performance. Consult the network
+ * controller's datasheet and supporting DPDK documentation for guidance
+ * on how these parameters should be set.
+ */
+#define RX_PTHRESH 8 /**< Default values of RX prefetch threshold reg. */
+#define RX_HTHRESH 8 /**< Default values of RX host threshold reg. */
+#define RX_WTHRESH 4 /**< Default values of RX write-back threshold reg. */
+
+
 static const struct rte_eth_rxconf rx_conf = {
     .rx_thresh = {
         .pthresh = RX_PTHRESH,
@@ -136,6 +117,16 @@ static const struct rte_eth_rxconf rx_conf = {
         .wthresh = RX_WTHRESH,
     },
 };
+
+
+/*
+ * These default values are optimized for use with the Intel(R) 82599 10 GbE
+ * Controller and the DPDK ixgbe PMD. Consider using other values for other
+ * network controllers and/or network drivers.
+ */
+#define TX_PTHRESH 36 /**< Default values of TX prefetch threshold reg. */
+#define TX_HTHRESH 0  /**< Default values of TX host threshold reg. */
+#define TX_WTHRESH 0  /**< Default values of TX write-back threshold reg. */
 
 static const struct rte_eth_txconf tx_conf = {
     .tx_thresh = {
@@ -164,19 +155,63 @@ struct benchmark_core_statistics {
 } __rte_cache_aligned;
 
 
+/* Check the link status of all ports in up to 9s, and print them finally */
+static void
+check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
+{
+#define CHECK_INTERVAL 100 /* 100ms */
+#define MAX_CHECK_TIME 90 /* 9s (90 * 100ms) in total */
+    uint8_t portid, count, all_ports_up, print_flag = 0;
+    struct rte_eth_link link;
 
-// typedef struct context_s {
-//     unsigned int core_id;
-//     unsigned int queue_id;
-// } context_t;
+    printf("\nChecking link status");
+    fflush(stdout);
+    for (count = 0; count <= MAX_CHECK_TIME; count++) {
+        all_ports_up = 1;
+        for (portid = 0; portid < port_num; portid++) {
+            if ((port_mask & (1 << portid)) == 0)
+                continue;
+            memset(&link, 0, sizeof(link));
+            rte_eth_link_get_nowait(portid, &link);
+            /* print link status if flag set */
+            if (print_flag == 1) {
+                if (link.link_status)
+                    printf("Port %d Link Up - speed %u "
+                        "Mbps - %s\n", (uint8_t)portid,
+                        (unsigned)link.link_speed,
+                (link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
+                    ("full-duplex") : ("half-duplex\n"));
+                else
+                    printf("Port %d Link Down\n",
+                        (uint8_t)portid);
+                continue;
+            }
+            /* clear all_ports_up flag if any link down */
+            if (link.link_status == 0) {
+                all_ports_up = 0;
+                break;
+            }
+        }
+        /* after finally printing all link status, get out */
+        if (print_flag == 1)
+            break;
 
+        if (all_ports_up == 0) {
+            printf(".");
+            fflush(stdout);
+            rte_delay_ms(CHECK_INTERVAL);
+        }
 
-/* 1500 bytes MTU + 14 Bytes Ethernet header */
-// int pktlen;
+        /* set the print_flag if all ports up or timeout */
+        if (all_ports_up == 1 || count == (MAX_CHECK_TIME - 1)) {
+            print_flag = 1;
+            printf("done\n");
+        }
+    }
+}
 
 
 // End for MegaKV
-
 
 static const size_t DBWRAPPER_PREALLOC_KEY_SIZE = 64;
 static const size_t DBWRAPPER_PREALLOC_VALUE_SIZE = 1024;
@@ -189,29 +224,68 @@ public:
 
 class CDBWrapper;
 
+namespace megakv {
+    enum request_t = {MEGA_JOB_GET=0x2, MEGA_JOB_SET=0x3, MEGA_JOB_DEL=0x4};
+    struct Request {
+        request_t type;
+        char *key;
+        char *val;
+        uint16_t key_size;
+        uint32_t val_size;
 
-class WriteBatch {
-private:
-    struct rte_mempool *send_pktmbuf_pool = NULL;
-    lcore_queue_conf *qconf;
-    unsigned int core_id;
-    unsigned int queue_id;
-    char *curr_pos = NULL; // points to the position of the packet we have to write. 
-public:
-    WriteBatch::WriteBatch();
+        Request(request_t _type, char *_key, uint16_t _key_size, char *_val=NULL, uint32_t _val_size = 0){
+            type = _type;
+            key = _key;
+            key_size = _key_size;
+            val = _val;
+            val_size = _val_size;
+        }
 
-    // struct rte_mbuf *m;
+        size_t size() {
+            if(type == MEGA_JOB_GET){
+                return 2 + 2 + key_size;
+            }else if (type == MEGA_JOB_SET){
+                return 2 + 2 + 4 + key_size + val_size;
+            }else if (type == MEGA_JOB_DEL){
+                return 2 + 2 + key_size;
+            }else{
+                LogPrintf("%s\n", "Fatal MegaKV error: Invalid request type.");
+                throw dbwrapper_error("Fatal MegaKV error: Invalid request type.\n");
+            }
+            return 0;
+        }
 
-    // struct rte_mempool *recv_pktmbuf_pool[NUM_QUEUE];
-    // struct rte_mempool *send_pktmbuf_pool = NULL;
+    };
+    
+    struct Options
+    {
+        Options();
+        // several fields should go here
 
-    void Put(const char* key, size_t key_size, const char* value, size_t value_size);
 
-    void Clear();
+    };
+    
+    class WriteBatch {
+    private:
+        std::deque<megakv::Request *> request_v;
+        rte_mempool *send_pktmbuf_pool = NULL;
+        lcore_queue_conf *qconf;
+        unsigned int core_id;
+        unsigned int queue_id;
+    public:
+        WriteBatch::WriteBatch(unsigned int _core_id, unsigned int _queue_id);
 
-    void Delete(const char* key, size_t key_size);
+        void Put(const char* key, size_t key_size, const char* value, size_t value_size);
 
-};
+        void Clear();
+
+        void Delete(const char* key, size_t key_size);
+
+    };
+
+} // megakv
+
+
 
 /** These should be considered an implementation detail of the specific database.
  */
@@ -239,7 +313,7 @@ class CDBBatch
 private:
     const CDBWrapper &parent;
     // LevelDB::WriteBatch batch;
-    WriteBatch batch;
+    megakv::WriteBatch batch;
 
     CDataStream ssKey;
     CDataStream ssValue;
@@ -256,53 +330,12 @@ public:
         size_estimate(EIU_HEADER_LEN + MEGA_MAGIC_NUM_LEN + MEGA_END_MARK_LEN) { };
 
     void Clear();
-    // {
-    //     batch.Clear();
-    //     size_estimate = 0;
-    // }
-
 
     template <typename K, typename V>
     void Write(const K& key, const V& value);
-    // {
-    //     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey << key;
-    //     leveldb::Slice slKey(ssKey.data(), ssKey.size());
-
-    //     ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);
-    //     ssValue << value;
-    //     ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
-    //     leveldb::Slice slValue(ssValue.data(), ssValue.size());
-
-    //     batch.Put(slKey, slValue);
-    //     // LevelDB serializes writes as:
-    //     // - byte: header
-    //     // - varint: key length (1 byte up to 127B, 2 bytes up to 16383B, ...)
-    //     // - byte[]: key
-    //     // - varint: value length
-    //     // - byte[]: value
-    //     // The formula below assumes the key and value are both less than 16k.
-    //     size_estimate += 3 + (slKey.size() > 127) + slKey.size() + (slValue.size() > 127) + slValue.size();
-    //     ssKey.clear();
-    //     ssValue.clear();
-    // }
 
     template <typename K>
     void Erase(const K& key);
-    // {
-    //     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey << key;
-    //     leveldb::Slice slKey(ssKey.data(), ssKey.size());
-
-    //     batch.Delete(slKey);
-    //     // LevelDB serializes erases as:
-    //     // - byte: header
-    //     // - varint: key length
-    //     // - byte[]: key
-    //     // The formula below assumes the key is less than 16kB.
-    //     size_estimate += 2 + (slKey.size() > 127) + slKey.size();
-    //     ssKey.clear();
-    // }
 
     size_t SizeEstimate() const { return size_estimate; }
 };
@@ -339,34 +372,10 @@ public:
     void Next();
 
     template<typename K> bool GetKey(K& key);
-    // {
-    //     leveldb::Slice slKey = piter->key();
-    //     try {
-    //         CDataStream ssKey(slKey.data(), slKey.data() + slKey.size(), SER_DISK, CLIENT_VERSION);
-    //         ssKey >> key;
-    //     } catch (const std::exception&) {
-    //         return false;
-    //     }
-    //     return true;
-    // }
 
     template<typename V> bool GetValue(V& value);
-    // {
-    //     leveldb::Slice slValue = piter->value();
-    //     try {
-    //         CDataStream ssValue(slValue.data(), slValue.data() + slValue.size(), SER_DISK, CLIENT_VERSION);
-    //         ssValue.Xor(dbwrapper_private::GetObfuscateKey(parent));
-    //         ssValue >> value;
-    //     } catch (const std::exception&) {
-    //         return false;
-    //     }
-    //     return true;
-    // }
 
     unsigned int GetValueSize();
-    // {
-    //     return piter->value().size();
-    // }
 
 };
 
@@ -426,64 +435,15 @@ public:
 
     template <typename K, typename V>
     bool Read(const K& key, V& value) const;
-    // {
-    //     CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-    //     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey << key;
-    //     leveldb::Slice slKey(ssKey.data(), ssKey.size());
-
-    //     std::string strValue;
-    //     leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
-    //     if (!status.ok()) {
-    //         if (status.IsNotFound())
-    //             return false;
-    //         LogPrintf("LevelDB read failure: %s\n", status.ToString());
-    //         dbwrapper_private::HandleError(status);
-    //     }
-    //     try {
-    //         CDataStream ssValue(strValue.data(), strValue.data() + strValue.size(), SER_DISK, CLIENT_VERSION);
-    //         ssValue.Xor(obfuscate_key);
-    //         ssValue >> value;
-    //     } catch (const std::exception&) {
-    //         return false;
-    //     }
-    //     return true;
-    // }
 
     template <typename K, typename V>
     bool Write(const K& key, const V& value, bool fSync = false);
-    // {
-    //     CDBBatch batch(*this);
-    //     batch.Write(key, value);
-    //     return WriteBatch(batch, fSync);
-    // }
 
     template <typename K>
     bool Exists(const K& key) const;
-    // {
-    //     CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-    //     ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey << key;
-    //     leveldb::Slice slKey(ssKey.data(), ssKey.size());
-
-    //     std::string strValue;
-    //     leveldb::Status status = pdb->Get(readoptions, slKey, &strValue);
-    //     if (!status.ok()) {
-    //         if (status.IsNotFound())
-    //             return false;
-    //         LogPrintf("LevelDB read failure: %s\n", status.ToString());
-    //         dbwrapper_private::HandleError(status);
-    //     }
-    //     return true;
-    // }
 
     template <typename K>
     bool Erase(const K& key, bool fSync = false);
-    // {
-    //     CDBBatch batch(*this);
-    //     batch.Erase(key);
-    //     return WriteBatch(batch, fSync);
-    // }
 
     bool WriteBatch(CDBBatch& batch, bool fSync = false);
 
@@ -502,35 +462,12 @@ public:
 
     template<typename K>
     size_t EstimateSize(const K& key_begin, const K& key_end) const;
-    // {
-    //     CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
-    //     ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey1 << key_begin;
-    //     ssKey2 << key_end;
-    //     leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
-    //     leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
-    //     uint64_t size = 0;
-    //     leveldb::Range range(slKey1, slKey2);
-    //     pdb->GetApproximateSizes(&range, 1, &size);
-    //     return size;
-    // }
 
     /**
      * Compact a certain range of keys in the database.
      */
     template<typename K>
     void CompactRange(const K& key_begin, const K& key_end) const;
-    // {
-    //     CDataStream ssKey1(SER_DISK, CLIENT_VERSION), ssKey2(SER_DISK, CLIENT_VERSION);
-    //     ssKey1.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey2.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
-    //     ssKey1 << key_begin;
-    //     ssKey2 << key_end;
-    //     leveldb::Slice slKey1(ssKey1.data(), ssKey1.size());
-    //     leveldb::Slice slKey2(ssKey2.data(), ssKey2.size());
-    //     pdb->CompactRange(&slKey1, &slKey2);
-    // }
 
 };
 
